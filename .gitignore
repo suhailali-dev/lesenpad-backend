@@ -1,0 +1,14 @@
+node_modules
+dist
+coverage
+.turbo
+.env
+.env.local
+.env.*.local
+.pnpm-debug.log*
+.DS_Store
+uploads
+treasury.json
+treasury.json
+*.secret
+*.key

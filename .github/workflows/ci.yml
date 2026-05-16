@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: talea
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d talea"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/talea?schema=public
+      FRONTEND_ORIGIN: http://localhost:3000
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.17.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm exec prisma generate
+
+      - name: Apply migrations
+        run: pnpm exec prisma migrate deploy
+
+      - name: Seed database
+        run: pnpm exec prisma db seed
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Test
+        run: pnpm test
+
+      - name: End-to-end test
+        run: pnpm test:e2e
+
+      - name: Build
+        run: pnpm build
+
+      - name: Create release bundle
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: tar -czf release.tgz dist package.json pnpm-lock.yaml prisma prisma.config.ts ecosystem.config.js deploy
+
+      - name: Upload release bundle
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-release-${{ github.sha }}
+          path: release.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: verify
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download release bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-release-${{ github.sha }}
+          path: release
+
+      - name: Copy release bundle to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_PORT || 22 }}
+          source: release/*
+          target: /tmp/lesenpad-release-${{ github.sha }}
+
+      - name: Apply release on EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_PORT || 22 }}
+          script: |
+            set -euo pipefail
+            RELEASE_ROOT="/tmp/lesenpad-release-${{ github.sha }}"
+            RELEASE_TGZ="$(find "${RELEASE_ROOT}" -maxdepth 2 -name release.tgz -type f | head -n 1)"
+            RELEASE_DIR="${RELEASE_ROOT}/bundle"
+            if [[ -z "${RELEASE_TGZ}" ]]; then
+              echo "release.tgz not found under ${RELEASE_ROOT}" >&2
+              find "${RELEASE_ROOT}" -maxdepth 3 -print >&2 || true
+              exit 1
+            fi
+            mkdir -p "${RELEASE_DIR}"
+            tar -xzf "${RELEASE_TGZ}" -C "${RELEASE_DIR}"
+            bash "${RELEASE_DIR}/deploy/ec2/apply-release.sh" "${RELEASE_DIR}"
+            rm -rf "${RELEASE_ROOT}"
